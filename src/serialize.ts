@@ -121,8 +121,13 @@ async function streamToBlob(stream: ReadableStream, type: string): Promise<Blob>
   return b.type === type ? b : b.slice(0, b.size, type);
 }
 
-// Maps error name to error class for deserialization.
+// Maps error name to error class for deserialization. Null-prototype so that a wire-supplied
+// (attacker-controlled) name can't resolve to an inherited `Object.prototype` member: e.g. without
+// this, `ERROR_TYPES["constructor"]` would be `Object` (truthy, skipping the `|| Error` fallback)
+// and produce a `String` wrapper instead of an `Error`. Unknown names now resolve to `undefined`
+// and fall back to `Error`.
 const ERROR_TYPES: Record<string, any> = {
+  __proto__: null,
   Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError, AggregateError,
   // TODO: DOMError? Others?
 };
@@ -777,6 +782,13 @@ export class Evaluator {
               let propsObj = <Record<string, unknown>>props;
               for (let key of Object.keys(propsObj)) {
                 if (key === "name" || key === "message" || key === "stack") continue;
+                if (key in Object.prototype || key === "toJSON") {
+                  // Same guard as the plain-object deserializer: never let a wire-supplied key
+                  // override an `Object.prototype` member (especially `__proto__`) or `toJSON`.
+                  // Still evaluate the value so any stubs it contains are released.
+                  this.evaluateImpl(propsObj[key], result, key, depth + 1);
+                  continue;
+                }
                 anyResult[key] = this.evaluateImpl(propsObj[key], result, key, depth + 1);
               }
             }

@@ -124,6 +124,16 @@ export class WebSocketTransport<T extends string | ArrayBuffer = string> {
     } else {
       message = `${reason}`;
     }
+    // A WebSocket Close frame is a control frame, so its payload is capped at 125 bytes
+    // (RFC 6455 §5.5); the 2-byte status code leaves this many bytes for the UTF-8 reason, and
+    // close() throws if the reason is longer. Truncate on a code-point boundary: decoding the
+    // leading bytes with `stream: true` drops a trailing partial code point rather than emitting a
+    // replacement character (which could itself re-exceed the limit).
+    const maxReasonBytes = 125 - 2;
+    let reasonBytes = new TextEncoder().encode(message);
+    if (reasonBytes.length > maxReasonBytes) {
+      message = new TextDecoder().decode(reasonBytes.subarray(0, maxReasonBytes), { stream: true });
+    }
     this.#webSocket.close(3000, message);
 
     if (!this.#error) {

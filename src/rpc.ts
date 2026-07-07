@@ -1081,7 +1081,8 @@ class RpcSessionImpl implements Importer, Exporter {
           case "abort": {
             let payload = new Evaluator(this, this.encodingLevel).evaluate(msg[1]);
             payload.dispose();  // just in case -- should be no-op
-            this.abort(payload, false);
+            // Hand handlers the unwrapped reason, not the payload wrapper (matches "reject").
+            this.abort(payload.value, false);
             break;
           }
         }

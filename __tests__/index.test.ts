@@ -3364,3 +3364,116 @@ describe("Blob over RPC", () => {
     await pumpMicrotasks();
   });
 });
+
+describe("error deserialization and transport robustness", () => {
+  it("never resolves an error type name to an inherited Object.prototype member", () => {
+    // The error type name (the second wire element) is peer-controlled. It must not resolve to an
+    // inherited member such as `constructor` -- which would build a `String` wrapper rather than an
+    // `Error` (an `instanceof Error` bypass) -- nor to a non-constructor like `toString`, which
+    // would throw and tear down the session. Unknown names fall back to `Error`.
+    let confused =
+        deserialize('["error","constructor","attacker",null,{"injected":true}]') as
+            Error & Record<string, unknown>;
+    expect(confused).toBeInstanceOf(Error);
+    expect(confused).not.toBeInstanceOf(String);
+    expect(confused.name).toBe("Error");
+    expect(confused.message).toBe("attacker");
+    expect(confused.injected).toBe(true);  // legitimate own properties still round-trip
+
+    for (let name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+      let err = deserialize(`["error",${JSON.stringify(name)},"msg"]`);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe("msg");
+    }
+
+    // Real error subclasses still resolve to their concrete class.
+    expect(deserialize('["error","TypeError","t"]')).toBeInstanceOf(TypeError);
+    expect(deserialize('["error","RangeError","r"]')).toBeInstanceOf(RangeError);
+  });
+
+  it("does not let an error property bag override Object.prototype members", () => {
+    // Own-property-bag keys (the fifth wire element) are peer-controlled and must be filtered the
+    // same way the plain-object deserializer filters them, so keys like `__proto__`, `toString`,
+    // `valueOf`, and `toJSON` are never written onto the error (and `__proto__` never reaches the
+    // prototype setter).
+    let wire = '["error","Error","boom","at x:1:1",' +
+        '{"code":"E_TEST","__proto__":{"polluted":true},"toString":"x","valueOf":"x",' +
+        '"hasOwnProperty":"x","toJSON":"x"}]';
+    let err = deserialize(wire) as Error & Record<string, unknown>;
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe("boom");
+    // The legitimate own property is still copied across.
+    expect(Object.prototype.hasOwnProperty.call(err, "code")).toBe(true);
+    expect(err.code).toBe("E_TEST");
+
+    for (let key of ["toString", "valueOf", "hasOwnProperty", "toJSON", "__proto__"]) {
+      expect(Object.prototype.hasOwnProperty.call(err, key)).toBe(false);
+    }
+    // Prototype and behavior are intact, and nothing leaked onto Object.prototype.
+    expect(Object.getPrototypeOf(err)).toBe(Error.prototype);
+    expect(typeof err.toString).toBe("function");
+    expect((err as Record<string, unknown>).polluted).toBeUndefined();
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("delivers the unwrapped abort reason to error handlers, not the payload wrapper", async () => {
+    // Deliberately not using `using`: the session is intentionally aborted below.
+    let harness = new TestHarness(new TestTarget());
+    let captured: unknown[] = [];
+    harness.stub.onRpcBroken(error => { captured.push(error); });
+
+    // Feed the server a malformed message so its read loop throws. The server replies with an
+    // ["abort", reason] message; the client's abort handler must forward the unwrapped reason,
+    // not the internal payload wrapper.
+    harness.clientTransport.send('["not a valid message"]');
+    await pumpMicrotasks();
+
+    expect(captured.length).toBe(1);
+    expect(captured[0]).toBeInstanceOf(Error);
+    expect(String((captured[0] as Error).message)).toContain("bad RPC message");
+  });
+
+  it("truncates an over-long WebSocket close reason on a code-point boundary", async () => {
+    let closeCalls: { code: number, reason: string }[] = [];
+    let closeThrew = false;
+    let messageListeners: ((ev: any) => void)[] = [];
+
+    // A WebSocket Close frame's reason is capped at 125 - 2 UTF-8 bytes (RFC 6455 §5.5).
+    let maxReasonBytes = 125 - 2;
+
+    let fakeWs: any = {
+      readyState: (globalThis as any).WebSocket.OPEN,
+      binaryType: "",
+      addEventListener(type: string, cb: (ev: any) => void) {
+        if (type === "message") messageListeners.push(cb);
+      },
+      send() {},
+      close(code: number, reason: string) {
+        // Mirror the real contract: an over-long reason throws.
+        if (new TextEncoder().encode(reason).length > maxReasonBytes) {
+          closeThrew = true;
+          throw new Error("close reason too long");
+        }
+        closeCalls.push({ code, reason });
+      },
+    };
+
+    newWebSocketRpcSession(fakeWs);
+
+    // A peer-supplied abort reason that straddles the byte limit with a multi-byte character:
+    // (maxReasonBytes - 1) ASCII bytes plus a 2-byte "é", so the "é" begins at the last allowed
+    // byte. Truncation must drop the partial "é" cleanly rather than emit a replacement character
+    // (which is itself 3 bytes and would re-exceed the limit).
+    let reason = "a".repeat(maxReasonBytes - 1) + "\u00e9";
+    for (let cb of messageListeners) cb({ data: JSON.stringify(["abort", reason]) });
+    await pumpMicrotasks();
+
+    expect(closeThrew).toBe(false);
+    expect(closeCalls.length).toBe(1);
+    let sentReason = closeCalls[0].reason;
+    expect(new TextEncoder().encode(sentReason).length).toBeLessThanOrEqual(maxReasonBytes);
+    expect(sentReason).not.toContain("\uFFFD");
+    expect(sentReason).toBe("a".repeat(maxReasonBytes - 1));
+  });
+});
