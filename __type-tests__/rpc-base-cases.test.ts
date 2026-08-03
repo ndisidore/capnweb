@@ -150,3 +150,27 @@ api.invoke((name: string, attempt: number) => {
 
 // @ts-expect-error headers argument must be Headers
 api.roundTripHeaders(new Map([["x-id", "1"]]))
+
+// A stub can be built from a promise for a target or for another stub, and keeps the target's
+// type either way.
+expectType<RpcStub<PointTarget>>(new RpcStub(Promise.resolve(new PointTarget())))
+expectType<RpcStub<PointTarget>>(new RpcStub(pointStub))
+expectType<RpcStub<PointTarget>>(
+  new RpcStub(Promise.resolve(new RpcStub(new PointTarget())))
+)
+expectType<RpcStub<PointTarget>>(new RpcStub<PointTarget>(Promise.reject(new Error("x"))))
+expectType<RpcStub<PointTarget>>(new RpcStub<PointTarget>({ then(resolve) { resolve(point) } }))
+
+class ThenablePointTarget extends PointTarget {
+  then(resolve: (value: string) => unknown): unknown { return resolve("not a promise") }
+}
+type CallableThenable = ((value: number) => string) & {
+  then(resolve: (value: PointTarget) => unknown): unknown
+}
+declare const callableThenable: CallableThenable
+
+expectType<RpcStub<ThenablePointTarget>>(new RpcStub(new ThenablePointTarget()))
+expectType<RpcStub<CallableThenable>>(new RpcStub(callableThenable))
+
+// @ts-expect-error the promise must resolve to something compatible with the stub's type
+void new RpcStub<PointTarget>(Promise.resolve(123))

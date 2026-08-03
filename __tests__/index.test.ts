@@ -9,6 +9,7 @@ import { deserialize, serialize, RpcSession, type RpcSessionOptions, RpcTranspor
          newHttpBatchRpcSession} from "../src/index.js"
 import { swapByteOrder } from "../src/serialize.js"
 import { MAX_CLOSE_REASON_BYTES } from "../src/websocket.js"
+import { PromiseStubHook, RpcPayload } from "../src/core.js"
 import { Counter, TestTarget } from "./test-util.js";
 
 type CustomEncodingLevel = RpcTransportWithCustomEncoding["encodingLevel"];
@@ -545,6 +546,7 @@ class TestTransport implements RpcTransport {
   private waiter?: () => void;
   private aborter?: (err: any) => void;
   public log = false;
+  public sentLog: string[] = [];
   private fenced = false;
 
   send(message: string): void {
@@ -553,6 +555,7 @@ class TestTransport implements RpcTransport {
     message = message.replaceAll("$remove$", "");
 
     if (this.log) console.log(`${this.name}: ${message}`);
+    this.sentLog.push(message);
     this.partner!.queue.push(message);
     if (this.partner!.waiter && !this.partner!.fenced) {
       this.partner!.waiter();
@@ -2173,6 +2176,223 @@ describe("onRpcBroken", () => {
       {which: "counter1", error: new Error("test disconnect")},
       {which: "hangingCall", error: new Error("test disconnect")},
     ]);
+  });
+});
+
+// =======================================================================================
+
+describe("promise-backed stubs", () => {
+  it("pipelines through a pending promise without pulling the resolution", async () => {
+    await using harness = new TestHarness(new TestTarget());
+
+    let {promise, resolve} = Promise.withResolvers<RpcStub<TestTarget>>();
+    using stub = new RpcStub<TestTarget>(promise);
+
+    using counter = stub.makeCounter(1);
+    let result = counter.increment(2);
+    resolve(harness.stub.dup());
+    expect(await result).toBe(3);
+
+    // Only the final result was pulled: neither the promise-backed stub's resolution nor the
+    // intermediate counter was transmitted.
+    let sent = harness.clientTransport.sentLog;
+    expect(sent.some(msg => msg.startsWith('["push"'))).toBe(true);
+    expect(sent.filter(msg => msg.startsWith('["pull"'))).toHaveLength(1);
+  });
+
+  it("queues calls made before resolution and delivers them in order", async () => {
+    let calls: number[] = [];
+    class Recorder extends RpcTarget {
+      record(i: number) { calls.push(i); return i; }
+    }
+
+    let {promise, resolve} = Promise.withResolvers<Recorder>();
+    using stub = new RpcStub<Recorder>(promise);
+
+    let results = [stub.record(1), stub.record(2), stub.record(3)];
+    expect(calls).toStrictEqual([]);
+
+    resolve(new Recorder());
+    expect(await Promise.all(results)).toStrictEqual([1, 2, 3]);
+    expect(calls).toStrictEqual([1, 2, 3]);
+  });
+
+  it("accepts a promise for a target, a remote stub, or a plain value", async () => {
+    await using harness = new TestHarness(new TestTarget());
+
+    using target = new RpcStub<Counter>(Promise.resolve(new Counter(1)));
+    expect(await target.increment()).toBe(2);
+
+    using remote = new RpcStub<TestTarget>(Promise.resolve(harness.stub.dup()));
+    expect(await remote.square(3)).toBe(9);
+
+    using value = new RpcStub<{foo: number}>(Promise.resolve({foo: 123}));
+    expect(await value.foo).toBe(123);
+  });
+
+  it("rejects a thenable that resolves to itself", async () => {
+    let reads = 0;
+    let thenable = {
+      get then(): any {
+        if (++reads > 10) throw new Error("assimilation looped");
+        return (resolve: (value: unknown) => void) => { resolve(thenable); };
+      }
+    };
+
+    using stub = new RpcStub<Counter>(<any>thenable);
+    await expect(() => stub.increment()).rejects.toThrow("Thenable resolved to itself.");
+    expect(reads).toBe(1);
+  });
+
+  it("terminates when `then` is a getter returning a different value each read", async () => {
+    // Detecting with one read and assimilating with another used to fulfill with the thenable
+    // itself, which came straight back around: an infinite microtask loop that never settled.
+    let reads = 0;
+    let target = new Counter(1);
+    let thenable = {
+      get then() {
+        if (++reads > 10) throw new Error("`then` read repeatedly; assimilation looped");
+        return (reads % 2) ? (resolve: (value: Counter) => void) => { resolve(target); }
+                           : <any>undefined;
+      }
+    };
+
+    using stub = new RpcStub<Counter>(thenable);
+    expect(await stub.increment(2)).toBe(3);
+  });
+
+  it("treats a callable thenable as a function target, not a promise", async () => {
+    let thenCalls = 0;
+    let fn = (i: number) => i + 5;
+    (<any>fn).then = (resolve: (value: unknown) => void) => { ++thenCalls; resolve("resolved!"); };
+
+    using stub = new RpcStub(fn);
+    expect(await stub(3)).toBe(8);
+    expect(thenCalls).toBe(0);
+  });
+
+  it("keeps an RpcPromise lazy when wrapped in a stub", async () => {
+    await using harness = new TestHarness(new TestTarget());
+
+    using counter = new RpcStub(harness.stub.makeCounter(1));
+    expect(await counter.increment(2)).toBe(3);
+
+    let sent = harness.clientTransport.sentLog;
+    expect(sent.filter(msg => msg.startsWith('["pull"'))).toHaveLength(1);
+  });
+
+  it("reports rejection to calls and to onRpcBroken", async () => {
+    let error = new Error("nope");
+    using stub = new RpcStub<Counter>(Promise.reject(error));
+
+    let broken: any[] = [];
+    stub.onRpcBroken(err => { broken.push(err); });
+
+    await expect(() => stub.increment()).rejects.toThrow("nope");
+    expect(broken).toStrictEqual([error]);
+  });
+
+  it("disposes copied call arguments when the backing promise rejects", async () => {
+    let disposed = false;
+    class Disposable extends RpcTarget {
+      [Symbol.dispose]() { disposed = true; }
+    }
+
+    let argument = new RpcStub(new Disposable());
+    let hook = new PromiseStubHook(Promise.reject(new Error("nope")));
+    let result = hook.call([], RpcPayload.fromAppParams([argument]));
+
+    await expect(result.pull()).rejects.toThrow("nope");
+    argument[Symbol.dispose]();
+    expect(disposed).toBe(true);
+  });
+
+  it("disposes copied stream arguments when the backing promise rejects", async () => {
+    let disposed = false;
+    class Disposable extends RpcTarget {
+      [Symbol.dispose]() { disposed = true; }
+    }
+
+    let argument = new RpcStub(new Disposable());
+    let hook = new PromiseStubHook(Promise.reject(new Error("nope")));
+    let result = hook.stream(["write"], RpcPayload.fromAppParams([argument]));
+
+    await expect(result.promise).rejects.toThrow("nope");
+    argument[Symbol.dispose]();
+    expect(disposed).toBe(true);
+  });
+
+  it("delivers a call initiated before disposal", async () => {
+    let disposed = false;
+    class DisposableCounter extends Counter {
+      [Symbol.dispose]() { disposed = true; }
+    }
+
+    let stub = new RpcStub(Promise.resolve(new DisposableCounter(1)));
+    await pumpMicrotasks();
+
+    let result = stub.increment(2);
+    stub[Symbol.dispose]();
+
+    expect(disposed).toBe(false);
+    expect(await result).toBe(3);
+    expect(disposed).toBe(true);
+  });
+
+  it("turns a throwing then getter into a broken stub", async () => {
+    let error = new Error("getter broke");
+    let thenable = {
+      get then(): PromiseLike<Counter>["then"] { throw error; }
+    };
+
+    using stub = new RpcStub<Counter>(<any>thenable);
+    await expect(() => stub.increment()).rejects.toThrow(error);
+  });
+
+  it("does not report an unhandled rejection for an unused stub", async () => {
+    new RpcStub<Counter>(Promise.reject(new Error("ignored")));
+    await pumpMicrotasks();
+  });
+
+  it("disposes the eventual target when disposed before resolution", async () => {
+    let disposed = false;
+    class Disposable extends RpcTarget {
+      [Symbol.dispose]() { disposed = true; }
+    }
+
+    let {promise, resolve} = Promise.withResolvers<Disposable>();
+    let stub = new RpcStub<Disposable>(promise);
+    stub[Symbol.dispose]();
+
+    resolve(new Disposable());
+    await pumpMicrotasks();
+    expect(disposed).toBe(true);
+  });
+
+  it("preserves brokenness when adopting a remote stub", async () => {
+    await using harness = new TestHarness(new TestTarget());
+    using stub = new RpcStub(harness.stub.dup());
+
+    let errors: any[] = [];
+    stub.onRpcBroken(error => { errors.push(error); });
+
+    harness.clientTransport.forceReceiveError(new Error("test disconnect"));
+    await pumpMicrotasks();
+    expect(errors).toStrictEqual([new Error("test disconnect")]);
+  });
+
+  it("keeps adopted stub disposal idempotent", () => {
+    let disposals = 0;
+    class Disposable extends RpcTarget {
+      [Symbol.dispose]() { ++disposals; }
+    }
+
+    let inner = new RpcStub(new Disposable());
+    let outer = new RpcStub(inner);
+    inner[Symbol.dispose]();
+    outer[Symbol.dispose]();
+
+    expect(disposals).toBe(1);
   });
 });
 

@@ -6,7 +6,7 @@ import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPr
 import { serialize, deserialize, EncodingLevel } from "./serialize.js";
 import { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
 import { RpcLimits, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH } from "./serialize.js";
-import { RpcTargetBranded, RpcCompatible, Stub, Stubify, __RPC_TARGET_BRAND } from "./types.js";
+import { RpcTargetBranded, RpcCompatible, Stub, Stubable, Stubify, __RPC_TARGET_BRAND } from "./types.js";
 import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
          newWorkersWebSocketRpcResponse, WebSocketTransport } from "./websocket.js";
 import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
@@ -34,9 +34,21 @@ export type { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport,
  * invoke any method name, and the invocation will be sent to the server. If it turns out that no
  * such method exists on the remote object, an exception is thrown back. But the client does not
  * actually know, until that point, what methods exist.
+ *
+ * A stub can also be constructed from a `Promise` for a value or for another stub. Calls made
+ * before it resolves are queued, and pipelining still works: the resolution is only transmitted if
+ * you actually await it. Any non-callable thenable is accepted, not just `Promise`, so promises
+ * from another realm work too. A callable value is always treated as a function target (see
+ * "Functions" in the README), even if it has a `then` method.
  */
 export type RpcStub<T extends RpcCompatible<T>> = Stub<T>;
+type RpcThenable<T> = {
+  then(resolve: (value: T) => unknown, reject?: (reason: unknown) => unknown): unknown;
+};
 export const RpcStub: {
+  new <T extends RpcCompatible<T>>(value: Stub<T>): RpcStub<T>;
+  new <T extends Stubable>(value: T): RpcStub<T>;
+  new <T extends RpcCompatible<T>>(value: RpcThenable<T | Stub<T>>): RpcStub<T>;
   new <T extends RpcCompatible<T>>(value: T): RpcStub<T>;
 } = <any>RpcStubImpl;
 

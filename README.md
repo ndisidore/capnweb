@@ -241,6 +241,14 @@ A stub can be passed across RPC again, including over independent connections. I
 
 You may construct a stub explicitly without an RPC connection, using `new RpcStub(target)`. This is sometimes useful to be able to perform local calls as if they were remote, or to help manage disposal (see below).
 
+You can also construct a stub from a promise, using `new RpcStub(promiseForTargetOrStub)`. Calls made before the promise resolves are queued and delivered once it does; if it rejects, they fail with that error. This is still a stub, not an `RpcPromise`, so pipelining through it stays lazy: the resolution is only transmitted if something actually awaits it. Any non-callable thenable works, not just `Promise`, while a callable value is always treated as a function target even if it has a `then` method.
+
+Use a promise-backed `RpcStub` when your application controls when a capability becomes available. An `RpcPromise`, by contrast, is returned by an RPC call and represents a result pending on the peer.
+
+The application owns the backing promise. Cap'n Web provides no timeout, and disposing the stub does not cancel a promise that has not settled, so apply a deadline before constructing the stub if reconnect may stall.
+
+The promise and queued calls exist only in the current isolate. They do not survive Durable Object hibernation, eviction, restart, or deployment; applications must establish a new RPC session and re-derive capabilities after waking. Queued calls retain copies of their arguments until the promise settles, so applications exposing a pending stub to untrusted callers must also bound incoming requests.
+
 ### `RpcPromise<T>`
 
 Calling an RPC method returns an `RpcPromise` rather than a regular `Promise`. You can use an `RpcPromise` in all the ways a regular `Promise` can be used, that is, you can `await` it, call `.then()`, pass it to `Promise.resolve()`, etc. (This is all possible because `RpcPromise` is a ["thenable"](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise#thenables).)
@@ -567,6 +575,8 @@ export default {
   }
 }
 ```
+
+The WebSocket path uses the standard Workers WebSocket API and is not compatible with Durable Object WebSocket hibernation. A hibernating Durable Object needs a separately designed transport and resumable protocol; with the helpers shown here, clients must reconnect and re-derive capabilities after a disconnect or restart.
 
 #### Compatibility with Workers' built-in RPC
 

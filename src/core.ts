@@ -455,6 +455,54 @@ const PROXY_HANDLERS: ProxyHandler<{raw: RpcStub}> = {
   },
 };
 
+// Maps a value provided by the application to a hook for use by RpcStub.
+function hookForAppValue(value: any): StubHook {
+  if (typeForRpc(value) === "stub") {
+    // Constructing a stub from another stub transfers ownership of its hook rather than adding a
+    // wrapper layer that loses hook-local behavior such as brokenness.
+    return unwrapStubTakingOwnership(value);
+  }
+
+  if (value instanceof RpcTarget || typeof value === "function") {
+    return TargetStubHook.create(value, undefined);
+  }
+
+  // Read `then` exactly once; a getter with side effects could otherwise make assimilation loop.
+  let then;
+  try {
+    then = typeof value === "object" && value !== null
+        ? (<PromiseLike<unknown>>value).then : undefined;
+  } catch (err) {
+    let hook = new PromiseStubHook(Promise.reject(err));
+    hook.ignoreUnhandledRejections();
+    return hook;
+  }
+
+  // Callable thenables are targets. Awaiting an `RpcPromise` here would defeat its laziness;
+  // workerd's native promises have their own representation.
+  if (typeof then === "function" && typeForRpc(value) !== "rpc-thenable") {
+    // Accept any non-callable thenable so that promises from another realm work.
+    let hook = new PromiseStubHook(assimilate(value, then).then(hookForAppValue));
+    hook.ignoreUnhandledRejections();
+    return hook;
+  }
+
+  // Adopt the value with "return" semantics to take ownership of any stubs within.
+  return new PayloadStubHook(RpcPayload.fromAppReturn(value));
+}
+
+// Equivalent of `Promise.resolve(value)`, but using a `then` which the caller already read, so that
+// the value we assimilate is the same one that was detected.
+function assimilate(value: object, then: Function): Promise<any> {
+  return new Promise((resolve, reject) => then.call(value, (result: unknown) => {
+    if (result === value) {
+      reject(new TypeError("Thenable resolved to itself."));
+    } else {
+      resolve(result);
+    }
+  }, reject));
+}
+
 // Implementation of RpcStub.
 //
 // Note that the in the public API, we override the type of RpcStub to reflect the interface
@@ -472,13 +520,7 @@ export class RpcStub extends RpcTarget {
       // the app can pass something that isn't a StubHook -- within the implementation, though,
       // we always pass StubHook.)
       let value = <any>hook;
-      if (value instanceof RpcTarget || value instanceof Function) {
-        hook = TargetStubHook.create(value, undefined);
-      } else {
-        // We adopt the value with "return" semantics since we want to take ownership of any stubs
-        // within.
-        hook = new PayloadStubHook(RpcPayload.fromAppReturn(value));
-      }
+      hook = hookForAppValue(value);
 
       // Don't let app set this.
       if (pathIfPromise) {
@@ -1985,7 +2027,12 @@ export class PromiseStubHook extends StubHook {
     // can't serialize them yet, we have to deep-copy them now.
     args.ensureDeepCopied();
 
-    return new PromiseStubHook(this.promise.then(hook => hook.call(path, args)));
+    return new PromiseStubHook(this.promise.then(
+        hook => hook.call(path, args),
+        err => {
+          args.dispose();
+          throw err;
+        }));
   }
 
   stream(path: PropertyPath, args: RpcPayload): {promise: Promise<void>, size?: number} {
@@ -1993,10 +2040,15 @@ export class PromiseStubHook extends StubHook {
     // No size is returned because we can't know yet; this means the caller will await the promise,
     // which is the safe default (serialized writes).
     args.ensureDeepCopied();
-    let promise = this.promise.then(hook => {
-      let result = hook.stream(path, args);
-      return result.promise;
-    });
+    let promise = this.promise.then(
+        hook => {
+          let result = hook.stream(path, args);
+          return result.promise;
+        },
+        err => {
+          args.dispose();
+          throw err;
+        });
     return { promise };
   }
 
@@ -2049,15 +2101,8 @@ export class PromiseStubHook extends StubHook {
   }
 
   dispose(): void {
-    if (this.resolution) {
-      this.resolution.dispose();
-    } else {
-      this.promise.then(hook => {
-        hook.dispose();
-      }, err => {
-        // nothing to dispose
-      });
-    }
+    // Keep disposal behind calls already queued on this promise.
+    this.promise.then(hook => hook.dispose(), () => {});
   }
 
   onBroken(callback: (error: any) => void): void {
